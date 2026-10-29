@@ -1,0 +1,5 @@
+node_modules
+dist
+*.log
+scripts/out
+samples/head+(1).stl

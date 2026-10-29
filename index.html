@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HelmetFit — size a 3D-printed helmet to your head</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <header>
+    <h1>HelmetFit</h1>
+    <div class="project-bar">
+      <label>Project
+        <select id="project-select"><option value="">— unsaved —</option></select>
+      </label>
+      <button id="project-save">Save project</button>
+      <button id="project-export" title="Export project settings, groups, and pieces to a .helmetfit.json file">Export file</button>
+      <button id="project-import" title="Load a .helmetfit.json project file">Load file…</button>
+      <input type="file" id="project-file" accept=".helmetfit,.json,application/json" hidden />
+      <button id="project-delete" class="danger" title="Delete the selected saved project">Delete</button>
+      <span class="sep"></span>
+      <button id="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
+      <button id="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Left: head -->
+    <aside id="left" class="panel">
+      <section>
+        <h2>1. Your head</h2>
+        <label class="row">Saved heads
+          <select id="head-select"></select>
+        </label>
+        <div class="row buttons">
+          <button id="head-delete" class="danger">Delete saved head</button>
+        </div>
+        <div class="tabs">
+          <button class="tab active" data-tab="sample">Sample head + measurements</button>
+          <button class="tab" data-tab="import">Import head scan</button>
+        </div>
+
+        <div class="tab-body" data-tab-body="sample">
+          <label class="row">Start from
+            <select id="preset-select"></select>
+          </label>
+          <div class="row">
+            <label>Units
+              <select id="meas-unit"><option value="in">inches</option><option value="mm">mm</option><option value="cm">cm</option></select>
+            </label>
+          </div>
+          <div id="meas-fields" class="fields"></div>
+          <div class="row buttons">
+            <button id="fill-from-circ" title="Keep your circumference and fill the rest with typical proportions">Estimate rest from circumference</button>
+          </div>
+          <p id="head-warning" class="warning" hidden></p>
+          <p class="hint" id="model-circ"></p>
+        </div>
+
+        <div class="tab-body" data-tab-body="import" hidden>
+          <label class="file-btn">Choose STL / OBJ / 3MF…
+            <input type="file" id="head-file" accept=".stl,.obj,.3mf" hidden />
+          </label>
+          <p class="hint" id="head-file-name">No scan loaded.</p>
+          <label class="row">File units
+            <select id="head-unit"><option>mm</option><option>cm</option><option>in</option><option>m</option></select>
+          </label>
+          <p class="hint">The blue arrow must point out of the face and the head must be upright.</p>
+          <div class="row buttons">
+            <button id="head-auto-orient">Auto-orient</button>
+          </div>
+          <div class="rot-grid">
+            <span>Rotate 90°</span>
+            <button data-rot="x+">X ⟳</button><button data-rot="x-">X ⟲</button>
+            <button data-rot="y+">Y ⟳</button><button data-rot="y-">Y ⟲</button>
+            <button data-rot="z+">Z ⟳</button><button data-rot="z-">Z ⟲</button>
+          </div>
+          <label class="row">Rescale to my circumference (mm)
+            <input type="number" id="head-target-circ" min="300" max="800" step="1" placeholder="optional" />
+          </label>
+          <div class="row buttons"><button id="head-apply-circ">Apply</button><button id="head-clear-circ">Clear</button></div>
+        </div>
+
+        <div class="measured" id="head-measured"></div>
+        <p class="hint" id="eye-status"></p>
+        <div class="row buttons">
+          <button id="eye-pick" title="Click the centre of each eye on the head">Set eyes by clicking</button>
+          <button id="eye-auto">Auto eyes</button>
+        </div>
+
+        <label class="row">Save as
+          <input type="text" id="head-name" placeholder="e.g. Ben's head" />
+        </label>
+        <div class="row buttons">
+          <button id="head-save" class="primary">Save head</button>
+          <button id="head-export" title="Download this head as an STL (for test-fitting in CAD)">Export head STL</button>
+        </div>
+      </section>
+    </aside>
+
+    <!-- Centre: 3D view -->
+    <section id="viewport">
+      <div id="canvas-host"></div>
+      <div class="overlay top-left">
+        <div class="btn-group">
+          <button data-view="front">Front</button><button data-view="side">Side</button><button data-view="back">Back</button><button data-view="top">Top</button><button data-view="iso">3/4</button><button id="frame-all">Fit view</button>
+        </div>
+        <div class="btn-group">
+          <label><input type="checkbox" id="show-head" checked /> Head</label>
+          <label><input type="checkbox" id="show-helmet" checked /> Helmet</label>
+          <label><input type="checkbox" id="show-heatmap" /> Gap colours</label>
+          <label><input type="checkbox" id="show-eyes" checked /> Eye markers</label>
+          <button id="pics-open" hidden title="Pictures from the project file">Project pictures</button>
+          <label>Helmet see-through <input type="range" id="helmet-opacity" min="0.1" max="1" step="0.05" value="0.55" /></label>
+        </div>
+        <div class="btn-group">
+          <label>Cut-away
+            <select id="section-mode"><option value="off">Off</option><option value="side">Side (left/right)</option><option value="front">Front/back</option><option value="top">Top/bottom</option></select>
+          </label>
+          <input type="range" id="section-offset" min="-200" max="200" step="1" value="0" disabled />
+        </div>
+      </div>
+      <div class="overlay bottom-left" id="legend" hidden>
+        <div class="legend-bar"></div>
+        <div class="legend-labels"><span id="lg-min">touching</span><span id="lg-target">target</span><span id="lg-max">loose</span></div>
+        <div class="legend-note">grey = not covered by helmet</div>
+      </div>
+      <div class="overlay center" id="drop-hint" hidden>Drop helmet pieces to add them</div>
+      <div class="overlay top-right" id="pics" hidden>
+        <div class="pics-head"><span id="pics-caption"></span><button id="pics-close" title="Hide pictures">✕</button></div>
+        <img id="pics-img" alt="Project picture" title="Click to enlarge / shrink" />
+        <div class="pics-nav"><button id="pics-prev" title="Previous picture">‹</button><span id="pics-count"></span><button id="pics-next" title="Next picture">›</button></div>
+      </div>
+      <div class="overlay bottom-third" id="assemble-hud" data-anim="blocks" data-state="idle" data-empty="true" hidden>
+        <div class="hud-card">
+          <div class="hud-visual">
+            <div class="anim-stage anim-blocks">
+              <span class="blk b1"></span><span class="blk b2"></span><span class="blk b3"></span><span class="blk b4"></span>
+              <span class="blk-core"></span>
+            </div>
+          </div>
+          <div class="hud-body">
+            <div class="hud-header">
+              <span class="hud-badge" id="hud-title">LOADING…</span>
+            </div>
+            <div class="hud-message" id="hud-msg"></div>
+            <div class="hud-bar"><div class="hud-bar-fill"></div></div>
+          </div>
+        </div>
+      </div>
+      <div id="status" hidden></div>
+    </section>
+
+    <!-- Right: helmet -->
+    <aside id="right" class="panel">
+      <section>
+        <h2>2. Helmet / mask pieces</h2>
+        <label class="file-btn">Add pieces (STL / OBJ / 3MF)…
+          <input type="file" id="piece-files" accept=".stl,.obj,.3mf" multiple hidden />
+        </label>
+        <p class="hint">Pieces should be exported in the same coordinates (as assembled). You can also drag files onto the 3D view.</p>
+        <label class="row">File units
+          <select id="helmet-unit"><option>mm</option><option>cm</option><option>in</option><option>m</option></select>
+        </label>
+        <ul id="piece-list"></ul>
+        <div class="row buttons"><button id="group-add" hidden title="Create a layer group — click and drag pieces into or out of groups">+ New group</button><button id="lock-shown" hidden title="Lock every shown piece in place (or unlock them)">🔒 Lock all shown</button><button id="pieces-clear" class="danger" hidden>✕ Remove all pieces</button></div>
+        <div class="row buttons">
+          <button id="assemble-run" class="primary" title="Assemble shown groups and pieces by matching their cut faces and connectors. Groups stay together as pre-assembled sections.">Auto-assemble pieces</button>
+          <button id="snap-mode" title="Join pieces by hand: click a cut face on one piece, then the matching face on another">Snap pieces together…</button>
+        </div>
+        <details class="group-rules">
+          <summary>How Groups &amp; Auto-assemble work</summary>
+          <p class="hint">Click <strong>+ New group</strong> and <strong>click-and-drag</strong> pieces onto a group folder (like Photoshop / Illustrator layers) to organize pre-assembled sections, or drag pieces out to ungroup.</p>
+          <ul class="hint">
+            <li><strong>All groups stay together</strong> and do not get disassembled; unlocked groups can be resized as a whole.</li>
+            <li><strong>Locking</strong> preserves coordinate status relative to other locked pieces and size.</li>
+            <li><strong>Locked groups</strong> do not get resized or disassociated.</li>
+            <li><strong>Different groups are assembled together</strong> with other groups — each group acts like a pre-assembled section of a puzzle being fitted to other sections.</li>
+            <li><strong>Single items</strong> not part of a group or locked follow the same rules as before.</li>
+            <li><strong>Hidden items or groups</strong> do not participate in Auto-assemble.</li>
+          </ul>
+        </details>
+        <label class="check" title="When on, pieces that look laid out flat for printing are assembled automatically as soon as they load. Leave off if your files are already exported in their assembled positions."><input type="checkbox" id="auto-assemble-on-load" /> Auto-assemble print-plate layouts on load</label>
+        <p class="hint">Pieces laid out for printing can be put back together with Auto-assemble (needs flat cuts or connectors). Use Snap for anything it gets wrong or can't place, then Auto-assemble again to fill in the rest around your joins.</p>
+        <div id="snap-panel" class="snap-panel" hidden>
+          <div class="btn-group gizmo-modes">
+            <span class="hint">Match by</span>
+            <button data-snap-kind="faces" class="active" title="Pieces cut apart with flat cuts">Cut faces</button>
+            <button data-snap-kind="magnets" title="Parts with magnet pockets: click two pieces and their pockets are lined up">Magnets</button>
+            <button data-snap-kind="points" title="Parts that overlap or interlock: click matching spots on both">Points</button>
+          </div>
+          <p class="hint" id="snap-msg"></p>
+          <div class="row buttons"><button id="points-clear" hidden>Clear points</button></div>
+          <div id="snap-adjust" class="row buttons" hidden>
+            <button id="snap-next" title="Try the next way the two outlines line up">Next fit</button>
+            <button id="snap-ccw" title="Turn the moved piece around the joint">⟲ 15°</button>
+            <button id="snap-cw" title="Turn the moved piece around the joint">⟳ 15°</button>
+            <button id="snap-undo">Undo snap</button>
+          </div>
+          <div class="row buttons"><button id="snap-done" class="primary">Done snapping</button></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>3. Auto fit</h2>
+        <div class="fields two">
+          <label>Gap / padding (mm) <input type="number" id="fit-target" min="0" max="60" step="0.5" /></label>
+          <label>Minimum gap (mm) <input type="number" id="fit-min" min="0" max="40" step="0.5" /></label>
+        </div>
+        <label class="check"><input type="checkbox" id="fit-eyes" /> Line up eye holes / visor with the eyes</label>
+        <label class="check"><input type="checkbox" id="fit-rotation" /> Search orientation (try all 24 axis rotations)</label>
+        <label class="check"><input type="checkbox" id="fit-current" /> Start from current position</label>
+        <label class="check"><input type="checkbox" id="fit-lockscale" /> Keep current size (only move/rotate)</label>
+        <label class="check"><input type="checkbox" id="fit-nonuniform" /> Allow different X/Y/Z scale</label>
+        <div class="row buttons">
+          <button id="fit-run" class="primary">Auto fit</button>
+          <button id="fit-cancel" hidden>Cancel</button>
+        </div>
+        <progress id="fit-progress" max="1" value="0" hidden></progress>
+        <p class="hint" id="fit-msg"></p>
+      </section>
+
+      <section>
+        <h2>4. Adjust by hand</h2>
+        <div class="row">
+          <label>Move / resize what
+            <select id="target-select"><option value="assembly">Whole helmet</option></select>
+          </label>
+        </div>
+        <div class="btn-group gizmo-modes">
+          <button data-gizmo="translate" class="active" title="W">Move</button>
+          <button data-gizmo="rotate" title="E">Rotate</button>
+          <button data-gizmo="scale" title="R">Scale</button>
+        </div>
+        <div class="xform">
+          <span></span><span>X</span><span>Y</span><span>Z</span>
+          <span>Position mm</span><input type="number" step="1" data-xf="p0" /><input type="number" step="1" data-xf="p1" /><input type="number" step="1" data-xf="p2" />
+          <span>Rotation °</span><input type="number" step="1" data-xf="r0" /><input type="number" step="1" data-xf="r1" /><input type="number" step="1" data-xf="r2" />
+          <span>Scale %</span><input type="number" step="0.5" data-xf="s0" /><input type="number" step="0.5" data-xf="s1" /><input type="number" step="0.5" data-xf="s2" />
+        </div>
+        <label class="check"><input type="checkbox" id="lock-uniform" /> Keep proportions when scaling</label>
+        <div class="row buttons">
+          <button id="xf-reset">Reset</button>
+          <button id="xf-snap">Snap rotation to 90°</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>5. Fit report &amp; print</h2>
+        <div id="report"><p class="hint">Load a helmet to see how it fits.</p></div>
+        <div class="row buttons export-row">
+          <div class="split-btn" id="export-split">
+            <button id="export-print" class="primary split-main" title="Download all pieces scaled for printing, in their original orientation">Download Scaled (Zip)</button>
+            <button id="export-mode-toggle" class="primary split-caret" aria-haspopup="listbox" aria-expanded="false" title="Choose download mode (Zip archive or individual STL files)">▾</button>
+            <div class="split-menu" id="export-mode-menu" role="listbox" hidden>
+              <button type="button" class="split-option active" data-export-mode="zip" role="option">
+                <strong>Download Scaled (Zip)</strong>
+                <span>All scaled STLs in one .zip file (single save prompt)</span>
+              </button>
+              <button type="button" class="split-option" data-export-mode="files" role="option">
+                <strong>Download Scaled pieces</strong>
+                <span>Save each scaled .stl file individually</span>
+              </button>
+            </div>
+          </div>
+          <button id="export-worn" title="Pieces as positioned on the head">Download as worn (Zip)</button>
+        </div>
+      </section>
+    </aside>
+  </main>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
