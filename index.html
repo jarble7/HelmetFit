@@ -10,14 +10,13 @@
   <header>
     <h1>HelmetFit</h1>
     <div class="project-bar">
-      <label>Project
-        <select id="project-select"><option value="">— unsaved —</option></select>
+      <label title="Recently saved and loaded projects">Project
+        <select id="project-select"><option value="">— new project —</option></select>
       </label>
-      <button id="project-save">Save project</button>
-      <button id="project-export" title="Export project settings, groups, and pieces to a .helmetfit.json file">Export file</button>
-      <button id="project-import" title="Load a .helmetfit.json project file">Load file…</button>
+      <button id="project-save" title="Save the project file (and keep it in the Project list)">Save project</button>
+      <button id="project-import" title="Open a .helmetfit.json project file">Load project…</button>
       <input type="file" id="project-file" accept=".helmetfit,.json,application/json" hidden />
-      <button id="project-delete" class="danger" title="Delete the selected saved project">Delete</button>
+      <button id="project-new" title="Start a new, empty project (saved projects stay in the list)">New project</button>
       <span class="sep"></span>
       <button id="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
       <button id="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
@@ -165,7 +164,13 @@
         <ul id="piece-list"></ul>
         <div class="row buttons"><button id="group-add" hidden title="Create a layer group — click and drag pieces into or out of groups">+ New group</button><button id="lock-shown" hidden title="Lock every shown piece in place (or unlock them)">🔒 Lock all shown</button><button id="pieces-clear" class="danger" hidden>✕ Remove all pieces</button></div>
         <div class="row buttons">
-          <button id="assemble-run" class="primary" title="Assemble shown groups and pieces by matching their cut faces and connectors. Groups stay together as pre-assembled sections.">Auto-assemble pieces</button>
+          <label title="A model joins either by magnets or by flat cut faces — only that is searched for">Join by
+            <select id="join-by"><option value="magnets">Magnets</option><option value="faces">Cut faces</option></select>
+          </label>
+          <label title="The magnet size the model was designed for, if you know it — helps find its pockets">Magnet size
+            <select id="magnet-size"><option value="">Auto</option><option value="5x2">5×2 mm</option><option value="6x2">6×2 mm</option><option value="6x3">6×3 mm</option><option value="8x2">8×2 mm</option><option value="8x3">8×3 mm</option><option value="10x2">10×2 mm</option><option value="10x3">10×3 mm</option></select>
+          </label>
+          <button id="assemble-run" class="primary" title="Assemble shown groups and pieces by their magnets or cut faces (see Join by). Groups stay together as pre-assembled sections.">Auto-assemble pieces</button>
           <button id="snap-mode" title="Join pieces by hand: click a cut face on one piece, then the matching face on another">Snap pieces together…</button>
         </div>
         <details class="group-rules">

@@ -1,6 +1,6 @@
 {
   "name": "helmetfit",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Size a 3D-printed multi-piece helmet or mask to your head",
   "type": "module",

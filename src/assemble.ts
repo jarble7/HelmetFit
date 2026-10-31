@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
-import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { findMagnetHoles, matchMagnets, type MagnetHole } from './magnets';
+import { analyseSurface, flatRegions } from './surface';
 
 // Auto-assembly of pieces that were exported "print-ready" (each turned and
 // laid flat on the bed, so they no longer share coordinates).
@@ -64,52 +64,22 @@ interface Join {
 
 /** `normalDot` / `planeTol`: how flat a region must be (strict for cut faces, looser for magnet-pocket floors on bumpy meshes). */
 export function findCutFaces(geometry: THREE.BufferGeometry, piece: number, minArea = 40, normalDot = 0.9995, planeTol = 0.05): CutFace[] {
-  const strict = normalDot >= 0.999;
-  const g = mergeVertices(geometry.clone().deleteAttribute('normal'), 1e-3);
-  const pos = g.getAttribute('position'), idx = g.getIndex()!;
-  const nt = idx.count / 3;
-  const N: THREE.Vector3[] = new Array(nt), C: THREE.Vector3[] = new Array(nt), A = new Float64Array(nt);
-  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
-  for (let t = 0; t < nt; t++) {
-    a.fromBufferAttribute(pos, idx.getX(3 * t)); b.fromBufferAttribute(pos, idx.getX(3 * t + 1)); c.fromBufferAttribute(pos, idx.getX(3 * t + 2));
-    const n = new THREE.Vector3().crossVectors(b.clone().sub(a), c.clone().sub(a));
-    const ar = n.length() / 2;
-    A[t] = ar; N[t] = ar > 0 ? n.divideScalar(ar * 2) : n; C[t] = a.clone().add(b).add(c).divideScalar(3);
-  }
-  const vt: number[][] = Array.from({ length: pos.count }, () => []);
-  for (let t = 0; t < nt; t++) for (let k = 0; k < 3; k++) vt[idx.getX(3 * t + k)].push(t);
-  const seen = new Uint8Array(nt);
+  const surf = analyseSurface(geometry); // remembered per geometry, shared with pocket detection
+  const { pos, idx, N, C, A } = surf;
   const faces: CutFace[] = [];
-  for (let s = 0; s < nt; s++) {
-    if (seen[s] || A[s] === 0) continue;
-    const n0 = N[s], d0 = n0.dot(C[s]);
-    const stack = [s], tris: number[] = [];
-    seen[s] = 1;
-    let area = 0;
-    while (stack.length) {
-      const t = stack.pop()!;
-      tris.push(t); area += A[t];
-      for (let k = 0; k < 3; k++) for (const u of vt[idx.getX(3 * t + k)]) {
-        if (seen[u] || A[u] === 0) continue;
-        // Strict (cut faces): each triangle's own plane must match — keeps gently curved shell areas out.
-        // Loose (pocket floors on bumpy meshes): stay within planeTol of the seed plane.
-        const off = strict ? N[u].dot(C[u]) - d0 : n0.dot(C[u]) - d0;
-        if (N[u].dot(n0) > normalDot && Math.abs(off) < planeTol) { seen[u] = 1; stack.push(u); }
-      }
-    }
-    if (area < minArea) continue;
+  for (const { tris, area, seed } of flatRegions(surf, minArea, normalDot, planeTol)) {
+    const n0 = new THREE.Vector3(N[seed * 3], N[seed * 3 + 1], N[seed * 3 + 2]);
     // Boundary edges of the region = its outline.
-    const inRegion = new Set(tris);
-    const edgeCount = new Map<string, [number, number, number]>();
+    const edgeCount = new Map<number, [number, number, number]>();
     for (const t of tris) for (let k = 0; k < 3; k++) {
-      const i = idx.getX(3 * t + k), j = idx.getX(3 * t + ((k + 1) % 3));
-      const key = i < j ? `${i},${j}` : `${j},${i}`;
+      const i = idx[3 * t + k], j = idx[3 * t + ((k + 1) % 3)];
+      const key = i < j ? i * 4294967296 + j : j * 4294967296 + i;
       const e = edgeCount.get(key);
       if (e) e[2]++; else edgeCount.set(key, [i, j, 1]);
     }
     const centre = new THREE.Vector3();
     let wsum = 0;
-    for (const t of tris) { centre.addScaledVector(C[t], A[t]); wsum += A[t]; }
+    for (const t of tris) { centre.x += C[t * 3] * A[t]; centre.y += C[t * 3 + 1] * A[t]; centre.z += C[t * 3 + 2] * A[t]; wsum += A[t]; }
     centre.divideScalar(wsum);
     const u = Math.abs(n0.x) < 0.9 ? new THREE.Vector3(1, 0, 0).cross(n0).normalize() : new THREE.Vector3(0, 1, 0).cross(n0).normalize();
     const v = new THREE.Vector3().crossVectors(n0, u);
@@ -117,18 +87,17 @@ export function findCutFaces(geometry: THREE.BufferGeometry, piece: number, minA
     const p = new THREE.Vector3(), q = new THREE.Vector3();
     for (const [i, j, count] of edgeCount.values()) {
       if (count !== 1) continue;
-      p.fromBufferAttribute(pos, i).sub(centre); q.fromBufferAttribute(pos, j).sub(centre);
+      p.fromArray(pos, i * 3).sub(centre); q.fromArray(pos, j * 3).sub(centre);
       const len = p.distanceTo(q), steps = Math.max(1, Math.ceil(len / 0.5));
       for (let k = 0; k < steps; k++) {
         const w = p.clone().lerp(q, k / steps);
         outline.push([w.dot(u), w.dot(v)]);
       }
     }
-    void inRegion;
     const perimeter = outline.length * 0.5;
     const triangles = new Float32Array(tris.length * 9);
-    tris.forEach((t, k) => { for (let m = 0; m < 3; m++) { p.fromBufferAttribute(pos, idx.getX(3 * t + m)); triangles.set([p.x, p.y, p.z], k * 9 + m * 3); } });
-    if (outline.length >= 8) faces.push({ piece, normal: n0.clone(), centre, area, u, v, outline, triangles, perimeter });
+    tris.forEach((t, k) => { for (let m = 0; m < 3; m++) { const vi = idx[3 * t + m] * 3; triangles[k * 9 + m * 3] = pos[vi]; triangles[k * 9 + m * 3 + 1] = pos[vi + 1]; triangles[k * 9 + m * 3 + 2] = pos[vi + 2]; } });
+    if (outline.length >= 8) faces.push({ piece, normal: n0, centre, area, u, v, outline, triangles, perimeter });
   }
   return faces;
 }
@@ -374,20 +343,49 @@ function overlaps(
  * locked together as a rigid sub-assembly so groups can be auto-assembled onto
  * each other without taking apart their internal parts.
  */
-export async function autoAssemble(geometries: THREE.BufferGeometry[], onProgress?: (msg: string) => void, debug?: (msg: string) => void, seed?: THREE.Matrix4[], fixed?: boolean[], userGroups?: number[]): Promise<AssembleResult> {
+export interface AssembleOptions {
+  /** What the pieces join by — a model uses one or the other. Default: both. */
+  mode?: 'faces' | 'magnets';
+  /** Already-found cut faces / pockets per piece (same coordinates as `geometries`), to skip finding them again. */
+  faces?: CutFace[][];
+  holes?: MagnetHole[][];
+}
+
+export async function autoAssemble(geometries: THREE.BufferGeometry[], onProgress?: (msg: string) => void, debug?: (msg: string) => void, seed?: THREE.Matrix4[], fixed?: boolean[], userGroups?: number[], options: AssembleOptions = {}): Promise<AssembleResult> {
   const progress = onProgress ?? (() => {});
   const yieldNow = () => new Promise<void>((r) => setTimeout(r, 0));
   const T = (label: string, t0: number) => debug?.(`${label}: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
   const n = geometries.length;
   let t0 = performance.now();
-  progress('Finding cut faces…');
-  await yieldNow();
+  const useFaces = options.mode !== 'magnets', useMagnets = options.mode !== 'faces';
   const faces: CutFace[][] = [];
-  for (let i = 0; i < n; i++) { faces.push(findCutFaces(geometries[i], i)); await yieldNow(); }
+  if (useFaces) {
+    progress('Finding cut faces…');
+    await yieldNow();
+    for (let i = 0; i < n; i++) { faces.push(options.faces?.[i] ?? findCutFaces(geometries[i], i)); await yieldNow(); }
+  } else for (let i = 0; i < n; i++) faces.push([]);
   T('cut faces', t0); t0 = performance.now();
+  // Magnet pockets: pieces that interlock or overlap instead of meeting at flat cuts.
+  const holes: MagnetHole[][] = [];
+  if (useMagnets) {
+    progress('Looking for magnet pockets & alignment pegs…');
+    await yieldNow();
+    for (let i = 0; i < n; i++) { holes.push(options.holes?.[i] ?? findMagnetHoles(geometries[i], i)); await yieldNow(); }
+  } else for (let i = 0; i < n; i++) holes.push([]);
+  T('pockets', t0); t0 = performance.now();
 
   const seedFaces = new Set<CutFace>();
   let seedGroup = seed ? joinedGroups(faces, seed, seedFaces) : (userGroups ? Array.from({ length: n }, (_, i) => i) : null);
+  if (seed && seedGroup && useMagnets) {
+    // Pieces already joined by magnets (pockets face to face where they are now) stay joined.
+    const parent = seedGroup.slice();
+    const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+    const world = holes.map((hs, i) => hs.map((h) => ({ c: h.opening.clone().applyMatrix4(seed[i]), a: h.axis.clone().transformDirection(seed[i]) })));
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      if (world[i].some((x) => world[j].some((y) => x.c.distanceTo(y.c) < 1.5 && x.a.dot(y.a) < -0.85))) parent[find(j)] = find(i);
+    }
+    seedGroup = parent.map((_, i) => find(i));
+  }
   if (seedGroup && userGroups) {
     const parent = seedGroup.slice();
     const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
@@ -415,11 +413,6 @@ export async function autoAssemble(geometries: THREE.BufferGeometry[], onProgres
   matches.sort((x, y) => x.rms - y.rms);
   T('matching', t0); t0 = performance.now();
 
-  // Magnet pockets: pieces that interlock or overlap instead of meeting at flat cuts.
-  progress('Looking for magnet pockets & alignment pegs…');
-  await yieldNow();
-  const holes: MagnetHole[][] = [];
-  for (let i = 0; i < n; i++) { holes.push(findMagnetHoles(geometries[i], i)); await yieldNow(); }
   const magnetJoins: Join[] = [];
   for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
     if (seedGroup && seedGroup[i] === seedGroup[j]) continue;
@@ -501,6 +494,17 @@ export async function autoAssemble(geometries: THREE.BufferGeometry[], onProgres
     seedGroup = seedGroup.map((g) => (lockedGroups.has(g) ? g0 : g));
   }
   const isFixedGroup = (group: number[], g: number) => firstFixed >= 0 && group[firstFixed] === g;
+  /** Best alignment of group B onto group A by all their pockets (world frame), if it lines up more than `atLeast`. */
+  const groupMatchMemo = new Map<string, THREE.Matrix4 | null>();
+  const groupMagnetMatch = (membersA: number[], membersB: number[], place: THREE.Matrix4[], atLeast: number): THREE.Matrix4 | null => {
+    const key = [membersA, membersB].map((ms) => ms.map((k) => `${k}:${place[k].elements.map((e) => e.toFixed(1)).join(',')}`).join(';')).join('|');
+    if (groupMatchMemo.has(key)) return groupMatchMemo.get(key)!;
+    const inWorld = (ms: number[]) => ms.flatMap((k) => holes[k].map((h) => ({ ...h, opening: h.opening.clone().applyMatrix4(place[k]), axis: h.axis.clone().transformDirection(place[k]) })));
+    const best = matchMagnets(inWorld(membersA), inWorld(membersB), 1, 3)[0];
+    const out = best && best.pairs.length > atLeast ? best.bToA : null;
+    groupMatchMemo.set(key, out);
+    return out;
+  };
   const greedy = async (banned: Set<Join>, order: Join[] = joinsToTry) => {
     const group = seedGroup ? seedGroup.slice() : Array.from({ length: n }, (_, i) => i);
     const place = seed ? seed.map((m) => m.clone()) : Array.from({ length: n }, () => new THREE.Matrix4());
@@ -526,6 +530,13 @@ export async function autoAssemble(geometries: THREE.BufferGeometry[], onProgres
         move = place[m.pb].clone().multiply(m.bToA.clone().invert()).multiply(place[m.pa].clone().invert());
         [ga, gb] = [gb, ga];
         [membersA, membersB] = [membersB, membersA];
+      }
+      if (m.magnets > 0 && membersA.length + membersB.length > 2) {
+        // Match all pockets of both groups as they stand now: a piece joining a
+        // group can line up with several of its pieces at once, which pins its
+        // orientation far better than its pockets on one neighbour.
+        const better = groupMagnetMatch(membersA, membersB, place, m.magnets);
+        if (better) move = better;
       }
       const trial = place.map((p, i) => (group[i] === gb ? move.clone().multiply(p) : p));
       const ov = overlaps(bvhs, samples, membersA, membersB, trial, m.magnets > 0);

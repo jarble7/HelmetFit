@@ -4,7 +4,8 @@ import { buildSampleHead, DEFAULT_MEASUREMENTS, HEAD_PRESETS, MEASUREMENT_INFO, 
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { detectHeadEyes, looksLikeLens, surfacePointFront, type EyePair } from './landmarks';
 import { autoAssemble, cutFaceAt, findCutFaces, joinedGroups, rigidFit, snapCandidates, type CutFace } from './assemble';
-import { findMagnetHoles, matchMagnets, type MagnetHole } from './magnets';
+import { findMagnetHoles, matchMagnets, measurePocket, forgetPocketData, type MagnetHole, type MagnetSize } from './magnets';
+import { forgetSurface } from './surface';
 import { centreHead, guessHeadOrientation, measureHead } from './measure';
 import { guessUnit, exportSTL, exportSTLBytes, exportZip, downloadBlob, loadMeshParts, lastProjectImages, ACCEPTED_EXTENSIONS, type LoadedPart } from './io';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
@@ -602,6 +603,8 @@ async function addPieceFiles(files: File[]) {
     status(`Added ${loaded.length} piece(s)${unitMsg}${simplified ? ' — very detailed model: showing a simplified copy, downloads keep full detail' : ''}`);
     if (appliedFromProject > 0) {
       if (pendingProjectDoc?.assembly) writeTransform(viewer.assembly, pendingProjectDoc.assembly);
+      // The loaded project is complete now: keep it in the history list.
+      if (pendingProjectDoc && !pendingProjectDoc.pieces.some((sp) => !pieces.some((q) => q.name === sp.name))) await rememberProject(pendingProjectDoc.name || 'Project');
       status(`Applied project settings & positions to ${appliedFromProject} piece(s).`);
       afterTransformChange(true);
       return;
@@ -640,6 +643,29 @@ function refreshLens(which: Piece[] = pieces): string[] {
 // then the matching face on the piece to move.
 
 const cutFaceCache = new Map<THREE.BufferGeometry, CutFace[]>();
+// ---------------------------------------------------------------------------
+// How pieces join (one or the other per model) and the magnet size, if known.
+
+let joinBy: 'magnets' | 'faces' = localStorage.getItem('helmetfit.joinBy') === 'faces' ? 'faces' : 'magnets';
+let magnetSize: MagnetSize | undefined = parseMagnetSize(localStorage.getItem('helmetfit.magnetSize') ?? '');
+function parseMagnetSize(v: string): MagnetSize | undefined {
+  const m = v.match(/^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)$/);
+  return m ? { diameter: +m[1], thickness: +m[2] } : undefined;
+}
+/** Cut faces / pockets already found for a piece (without finding them now). */
+const cachedFaces = (p: Piece) => cutFaceCache.get(p.mesh.geometry) ?? [];
+const cachedPockets = (p: Piece) => pocketCache.get(p.mesh.geometry) ?? [];
+
+/** Find cut faces or pockets for every piece that doesn't have them yet, showing progress and keeping the page responsive. */
+async function prepareFeatures(kind: 'faces' | 'magnets', which: Piece[] = pieces) {
+  const todo = which.filter((p) => !(kind === 'faces' ? cutFaceCache : pocketCache).has(p.mesh.geometry));
+  for (let k = 0; k < todo.length; k++) {
+    status(`${kind === 'faces' ? 'Finding cut faces' : 'Finding magnet pockets'}… ${k + 1}/${todo.length} (${todo[k].name})`);
+    await new Promise((r) => setTimeout(r, 0));
+    if (kind === 'faces') cutFacesOf(todo[k]); else pocketsOf(todo[k]);
+  }
+}
+
 function cutFacesOf(p: Piece): CutFace[] {
   let f = cutFaceCache.get(p.mesh.geometry);
   if (!f) { f = findCutFaces(detailOf(p), 0); cutFaceCache.set(p.mesh.geometry, f); }
@@ -659,7 +685,7 @@ let magnetFirst = -1;
 const pocketCache = new Map<THREE.BufferGeometry, MagnetHole[]>();
 function pocketsOf(p: Piece): MagnetHole[] {
   let h = pocketCache.get(p.mesh.geometry);
-  if (!h) { h = findMagnetHoles(detailOf(p), 0); pocketCache.set(p.mesh.geometry, h); }
+  if (!h) { h = findMagnetHoles(detailOf(p), 0, undefined, magnetSize); pocketCache.set(p.mesh.geometry, h); }
   return h;
 }
 function pocketMarkers(p: Piece): THREE.Group {
@@ -693,8 +719,8 @@ function faceOverlay(faces: CutFace[], colour: string, name: string): THREE.Mesh
   return m;
 }
 
-function clearOverlays(name?: string) {
-  for (const p of pieces) for (const c of [...p.mesh.children]) {
+function clearOverlays(name?: string, only?: Piece) {
+  for (const p of only ? [only] : pieces) for (const c of [...p.mesh.children]) {
     if (c.name.startsWith('cutface') && (!name || c.name === name)) {
       p.mesh.remove(c);
       // Overlays can be a Group (magnet rings), so dispose every mesh inside.
@@ -704,7 +730,16 @@ function clearOverlays(name?: string) {
   viewer.requestRender();
 }
 
-function setSnapMode(on: boolean) {
+let snapModeToken = 0;
+async function setSnapMode(on: boolean) {
+  const token = ++snapModeToken;
+  if (on && snapKind !== 'points') {
+    // Find what this mode needs (once per piece; remembered after that) without freezing the page.
+    $('snap-panel').hidden = false;
+    $('snap-msg').textContent = snapKind === 'faces' ? 'Finding cut faces…' : 'Finding magnet pockets…';
+    await prepareFeatures(snapKind);
+    if (token !== snapModeToken) return; // mode changed meanwhile
+  }
   snapMode = on;
   snapFirst = null; snapJoin = null;
   pointPairs = []; pointA = -1; pointB = -1; magnetFirst = -1;
@@ -809,6 +844,7 @@ function applyPointFit() {
     : done.length === 2 ? 'lined up along the two points (add a 3rd pair to fix the twist)'
     : `best fit through ${done.length} pairs — points are ${fmt(fit.rms, 1)} mm apart on average`;
   $('snap-msg').textContent = `${pieces[j.b].name}${j.moved.length > 1 ? ` (+${j.moved.length - 1} joined)` : ''}: ${how}. Click another spot on ${pieces[j.a].name} to add a pair.`;
+  rememberLink(j.a, j.b, done.map((d) => d.a), done.map((d) => d.b));
 }
 
 /** Pocket pairs picked by hand (each pocket in its own piece's coordinates). */
@@ -831,23 +867,60 @@ function highlightPocket(p: Piece, h: MagnetHole, colour: string) {
 }
 
 /**
+ * Joins made by snapping, remembered so a later snap never pulls them apart.
+ * Each keeps matching anchor points on both pieces (pocket openings, face
+ * centres, picked points); it only counts while those still coincide, so undo
+ * and moving a piece away undo the join naturally.
+ */
+const snapLinks: Array<{ pa: Piece; pb: Piece; la: THREE.Vector3[]; lb: THREE.Vector3[] }> = [];
+function rememberLink(a: number, b: number, la: THREE.Vector3[], lb: THREE.Vector3[]) {
+  const pa = pieces[a], pb = pieces[b];
+  const k = snapLinks.findIndex((l) => (l.pa === pa && l.pb === pb) || (l.pa === pb && l.pb === pa));
+  if (k >= 0) snapLinks.splice(k, 1);
+  if (la.length) snapLinks.push({ pa, pb, la: la.map((v) => v.clone()), lb: lb.map((v) => v.clone()) });
+}
+
+/**
+ * Which pieces are currently connected: same group, a snap join still in
+ * place, cut faces pressed together, or magnet pockets face to face. Returns
+ * a group id per piece.
+ */
+function connectedGroups(): number[] {
+  for (const q of pieces) { q.mesh.updateMatrix(); q.mesh.updateMatrixWorld(true); }
+  const groups = joinedGroups(pieces.map(cachedFaces), pieces.map((q) => q.mesh.matrix));
+  const find = (k: number): number => (groups[k] === k ? k : (groups[k] = find(groups[k])));
+  const join = (u: number, v: number) => { groups[find(v)] = find(u); };
+  for (let u = 0; u < pieces.length; u++) for (let v = u + 1; v < pieces.length; v++) {
+    if (pieces[u].groupId && pieces[u].groupId === pieces[v].groupId) join(u, v);
+  }
+  // Magnet pockets face to face.
+  const pk = pieces.map((q) => cachedPockets(q).map((h) => ({ c: h.opening.clone().applyMatrix4(q.mesh.matrix), a: h.axis.clone().transformDirection(q.mesh.matrix) })));
+  for (let u = 0; u < pieces.length; u++) for (let v = u + 1; v < pieces.length; v++) {
+    if (pk[u].some((x) => pk[v].some((y) => x.c.distanceTo(y.c) < 1.5 && x.a.dot(y.a) < -0.85))) join(u, v);
+  }
+  // Snap joins still in place.
+  for (const l of snapLinks) {
+    const u = pieces.indexOf(l.pa), v = pieces.indexOf(l.pb);
+    if (u < 0 || v < 0) continue;
+    const off = l.la.reduce((acc, p, k) => acc + p.clone().applyMatrix4(l.pa.mesh.matrix).distanceTo(l.lb[k].clone().applyMatrix4(l.pb.mesh.matrix)), 0) / l.la.length;
+    if (off < 2) join(u, v);
+  }
+  for (let k = 0; k < pieces.length; k++) find(k);
+  return groups;
+}
+
+/**
  * Pieces that move when piece `i` is joined onto piece `a`: `i` plus anything
- * already joined to it (unless that includes `a`). Null if that would move a
- * locked piece — locked pieces stay put.
+ * already connected to it (unless that includes `a`). Null if that would move
+ * a locked piece — locked pieces stay put.
  */
 function movingSet(a: number, i: number): number[] | null {
   if (pieces[i].groupId && pieces[i].groupId === pieces[a].groupId) {
     $('snap-msg').textContent = `${pieces[i].name} and ${pieces[a].name} are in the same group — groups stay together as one section. Ungroup them first if you want to re-snap them internally.`;
     return null;
   }
-  for (const q of pieces) q.mesh.updateMatrix();
-  const groups = joinedGroups(pieces.map(cutFacesOf), pieces.map((q) => q.mesh.matrix));
-  // Union user-defined layer groups so grouped pieces always move together as one rigid section.
-  const find = (k: number): number => (groups[k] === k ? k : (groups[k] = find(groups[k])));
-  for (let u = 0; u < pieces.length; u++) for (let v = u + 1; v < pieces.length; v++) {
-    if (pieces[u].groupId && pieces[u].groupId === pieces[v].groupId) groups[find(v)] = find(u);
-  }
-  for (let k = 0; k < pieces.length; k++) find(k);
+  const groups = connectedGroups();
+  // Already joined to the fixed piece (e.g. adjusting a snap): only this piece moves.
   const moved = groups[i] !== groups[a] ? pieces.map((_, k) => k).filter((k) => groups[k] === groups[i]) : [i];
   const locked = moved.filter((k) => isPieceLocked(pieces[k]));
   if (locked.length) {
@@ -861,7 +934,17 @@ function onMagnetPick(i: number, hit: { point: THREE.Vector3; normal: THREE.Vect
   const p = pieces[i];
   p.mesh.updateMatrixWorld(true);
   const local = hit.point.clone().applyMatrix4(p.mesh.matrixWorld.clone().invert());
-  const pocket = pocketAt(p, local);
+  let pocket = pocketAt(p, local);
+  if (!pocket && (pocketPairs.length || pocketA >= 0)) {
+    // No ring here: the pocket wasn't found automatically — measure it from its walls where clicked.
+    const nLocal = hit.normal.clone().transformDirection(p.mesh.matrixWorld.clone().invert());
+    pocket = measurePocket(detailOf(p), local, nLocal, 0, magnetSize);
+    if (pocket) {
+      pocketsOf(p).push(pocket);
+      clearOverlays('cutface-pockets', p);
+      p.mesh.add(pocketMarkers(p));
+    } else { $('snap-msg').textContent = `No pocket found there on ${p.name} — click on the floor inside the magnet hole.`; return; }
+  }
   // Clicked a pocket ring: build pocket pairs by hand.
   if (pocket) { onPocketPick(i, pocket); return; }
   if (pocketPairs.length) { $('snap-msg').textContent = 'Click a pink pocket ring (or "Clear points" to start over).'; return; }
@@ -873,7 +956,14 @@ function onMagnetPick(i: number, hit: { point: THREE.Vector3; normal: THREE.Vect
   }
   const a = magnetFirst;
   magnetFirst = -1;
-  const found = matchMagnets(pocketsOf(pieces[a]), pocketsOf(pieces[i]), 6, 2);
+  // Match all pockets of everything connected to each side, as they sit now.
+  const groups = connectedGroups();
+  const sideA = pieces.map((_, k) => k).filter((k) => groups[k] === groups[a]);
+  const sideB = groups[i] === groups[a] ? [i] : pieces.map((_, k) => k).filter((k) => groups[k] === groups[i]);
+  const inAsm = (ks: number[]) => ks.flatMap((k) => pocketsOf(pieces[k]).map((h) => ({ ...h, opening: h.opening.clone().applyMatrix4(pieces[k].mesh.matrix), axis: h.axis.clone().transformDirection(pieces[k].mesh.matrix) })));
+  const Am = pieces[a].mesh.matrix.clone(), Bm = pieces[i].mesh.matrix.clone();
+  // matchMagnets gives T (moving side -> fixed side, assembly coords); as a b->a piece transform: A⁻¹·T·B.
+  const found = matchMagnets(inAsm(sideA), inAsm(sideB), 6, 2).map((f) => ({ ...f, bToA: Am.clone().invert().multiply(f.bToA).multiply(Bm) }));
   if (!found.length) { $('snap-msg').textContent = `Couldn't match ${pieces[a].name} and ${pieces[i].name} automatically. Click the pocket rings instead: a pocket on ${pieces[a].name}, then the pocket it joins on ${pieces[i].name} (2 pairs fix it exactly).`; return; }
   const moved = movingSet(a, i);
   if (!moved) return;
@@ -939,12 +1029,17 @@ function applyPocketFit() {
   };
   // Pockets lined up across the joint (pairs of a-pocket, b-pocket).
   const B = pieces[j.b].mesh;
+  // Count/refine against every pocket on the fixed side (the fixed piece and anything connected to it).
+  const groupsNow = connectedGroups();
+  const fixedSide = pieces.map((_, k) => k).filter((k) => groupsNow[k] === groupsNow[j.a] && !j.moved.includes(k));
+  const fixedPockets = fixedSide.flatMap((k) => pocketsOf(pieces[k]).map((h) => ({ h, k })));
   const linedUp = () => {
     const out: Array<[MagnetHole, MagnetHole]> = [];
     for (const hb of pocketsOf(pieces[j.b])) {
       const c = hb.opening.clone().applyMatrix4(B.matrix), ax = hb.axis.clone().transformDirection(B.matrix);
-      const ha = pocketsOf(pieces[j.a]).find((h) => h.opening.clone().applyMatrix4(A.matrix).distanceTo(c) < 1.5 && h.axis.clone().transformDirection(A.matrix).dot(ax) < -0.85);
-      if (ha) out.push([ha, hb]);
+      const hit = fixedPockets.find(({ h, k }) => h.opening.clone().applyMatrix4(pieces[k].mesh.matrix).distanceTo(c) < 1.5 && h.axis.clone().transformDirection(pieces[k].mesh.matrix).dot(ax) < -0.85);
+      // Keep the pair in the fixed piece's coordinates for the refit.
+      if (hit) out.push([{ ...hit.h, opening: hit.h.opening.clone().applyMatrix4(pieces[hit.k].mesh.matrix).applyMatrix4(A.matrix.clone().invert()), axis: hit.h.axis.clone().transformDirection(pieces[hit.k].mesh.matrix).transformDirection(A.matrix.clone().invert()) }, hb]);
     }
     return out;
   };
@@ -964,6 +1059,8 @@ function applyPocketFit() {
   helmetFieldCache = null;
   afterTransformChange(true);
   const lined = pairsNow.length;
+  // Remember this join (by the pockets you picked) so later snaps keep it together.
+  rememberLink(j.a, j.b, done.map((d) => d.a.opening), done.map((d) => d.b.opening));
   const how = done.length === 1
     ? 'pockets meet face to face — add a 2nd pair to fix the twist'
     : `fitted through ${lined > done.length ? `all ${lined} lined-up` : done.length} pocket pairs (${fmt(fit.rms, 1)} mm off)`;
@@ -1034,6 +1131,15 @@ function applySnap() {
   helmetFieldCache = null;
   afterTransformChange(true);
   const c = j.candidates[j.index];
+  // Remember the join: matched pockets (magnets) or the pressed-together face centres (cut faces).
+  if (c.magnets) {
+    const la: THREE.Vector3[] = [], lb: THREE.Vector3[] = [];
+    for (const hb of cachedPockets(pieces[j.b])) {
+      const w = hb.opening.clone().applyMatrix4(pieces[j.b].mesh.matrix);
+      for (const ha of cachedPockets(pieces[j.a])) if (ha.opening.clone().applyMatrix4(A.matrix).distanceTo(w) < 1.5) { la.push(ha.opening); lb.push(hb.opening); break; }
+    }
+    rememberLink(j.a, j.b, la, lb);
+  } else if (j.fa && j.fb) rememberLink(j.a, j.b, [j.fa.centre], [j.fb.centre]);
   if (c.magnets) {
     $('snap-msg').textContent = `Joined ${pieces[j.b].name}${j.moved.length > 1 ? ` (+${j.moved.length - 1} joined)` : ''} to ${pieces[j.a].name}: ${c.magnets} magnet pockets line up (within ${fmt(c.rms, 1)} mm). Fit ${j.index + 1} of ${j.candidates.length} — "Next fit" if it's wrong.`;
     return;
@@ -1088,6 +1194,11 @@ async function runAutoAssemble(confirmFirst: boolean, automatic = false) {
     const toFile = (p: Piece) => new THREE.Matrix4().makeTranslation(p.origin.x, p.origin.y, p.origin.z);
     const groupIds = [...new Set(use.map((p) => p.groupId).filter((g): g is string => !!g))];
     const userGroups = use.map((p) => (p.groupId ? groupIds.indexOf(p.groupId) : -1));
+    // Only search for what the model joins by, reusing anything already found (shifted into file coordinates).
+    await prepareFeatures(joinBy, use);
+    // (Cached features are tagged piece 0; the assembler needs each one's index in `use`.)
+    const shiftFaces = (p: Piece, i: number) => cachedFaces(p).map((f) => ({ ...f, piece: i, centre: f.centre.clone().add(p.origin) }));
+    const shiftPockets = (p: Piece, i: number) => cachedPockets(p).map((h) => ({ ...h, piece: i, opening: h.opening.clone().add(p.origin) }));
     const res = await autoAssemble(
       use.map((p) => detailOf(p).clone().applyMatrix4(toFile(p))),
       (msg) => updateHudTask(`Auto-organizing: ${msg}`, 'AUTO-ORGANIZING…'),
@@ -1095,6 +1206,7 @@ async function runAutoAssemble(confirmFirst: boolean, automatic = false) {
       use.map((p) => p.mesh.matrix.clone().multiply(toFile(p).invert())),
       fixedFlags,
       userGroups,
+      { mode: joinBy, ...(joinBy === 'faces' ? { faces: use.map(shiftFaces) } : { holes: use.map(shiftPockets) }) },
     );
     res.matrices.forEach((m, i) => m.multiply(toFile(use[i])));
     const counts = new Map<number, number>();
@@ -1256,11 +1368,13 @@ function removeAllPieces() {
 
 function setHelmetUnit(u: LengthUnit) {
   cutFaceCache.clear(); pocketCache.clear(); // geometry is rescaled in place
+  for (const p of pieces) for (const g of [p.mesh.geometry, p.full]) if (g) { forgetSurface(g); forgetPocketData(g); }
   const ratio = UNIT_TO_MM[u] / UNIT_TO_MM[helmetUnit];
   helmetUnit = u;
   for (const p of pieces) {
     p.full?.scale(ratio, ratio, ratio);
     p.mesh.geometry.scale(ratio, ratio, ratio);
+    viewer.refreshPickData(p.mesh.geometry); // its hit-testing data was for the old size
     p.mesh.geometry.computeBoundingBox();
     p.mesh.geometry.computeBoundingSphere();
     delete p.mesh.geometry.userData.bvh;
@@ -1596,6 +1710,8 @@ viewer.onGizmoChange = () => {
   viewer.requestRender();
 };
 viewer.onGizmoEnd = () => afterTransformChange(true);
+viewer.pieceIndexOf = (o) => pieces.findIndex((p) => p.mesh === o);
+viewer.isPickable = (o) => { const p = pieces.find((q) => q.mesh === o); return !!p && isPieceVisible(p); };
 viewer.onPick = (i, hit) => {
   if (snapMode) { onSnapPick(i, hit); return; }
   if (i >= 0) {
@@ -1966,21 +2082,16 @@ async function exportPieces(mode: 'print' | 'worn', indices?: number[], forceFor
 // Projects
 
 async function refreshProjectList(selectId: string | null = currentProjectId) {
-  const list = await store.projects.list();
+  const list = (await store.projects.list()).sort((a, b) => b.updatedAt - a.updatedAt); // most recent first
   const sel = $('project-select') as HTMLSelectElement;
-  sel.innerHTML = '<option value="">— unsaved —</option>' + list.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('');
+  sel.innerHTML = '<option value="">— new project —</option>' + list.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('');
   sel.value = selectId ?? '';
 }
 
-async function saveProject() {
-  const current = currentProjectId ? await store.projects.get(currentProjectId) : undefined;
-  const name = prompt('Project name', current?.name ?? (pieces[0]?.name ?? 'My helmet'));
-  if (!name) return;
-  const all = await store.projects.list();
-  const existing = all.find((p) => p.name === name);
-  if (existing && existing.id !== currentProjectId && !confirm(`Replace the saved project "${name}"?`)) return;
+/** The current workspace as a stored project (for the history list). */
+function projectRecord(id: string, name: string): ProjectRecord {
   const rec: ProjectRecord = {
-    id: existing?.id ?? store.newId(),
+    id,
     name,
     headId: currentHeadId,
     groups: pieceGroups.map((g) => ({ ...g })),
@@ -1989,11 +2100,89 @@ async function saveProject() {
     fitSettings: { ...fitSettings },
     updatedAt: Date.now(),
   };
-  if (!currentHeadId) status('Tip: save the head too, so the project remembers which head it was fitted to.');
+  return rec;
+}
+
+/** Keep the current project in the history list (replacing an entry with the same name). */
+async function rememberProject(name: string) {
+  const existing = (await store.projects.list()).find((p) => p.name === name);
+  const rec = projectRecord(existing?.id ?? currentProjectId ?? store.newId(), name);
   await store.projects.put(rec);
   currentProjectId = rec.id;
+  currentProjectName = name;
   await refreshProjectList(rec.id);
-  status(`Saved project "${name}"`);
+}
+
+/** File the project was last saved to / loaded from (Chrome/Edge), so Save updates it in place. */
+let projectFileHandle: FileSystemFileHandle | null = null;
+let currentProjectName: string | null = null;
+type FilePickerWindow = Window & {
+  showSaveFilePicker?: (o: unknown) => Promise<FileSystemFileHandle>;
+  showOpenFilePicker?: (o: unknown) => Promise<FileSystemFileHandle[]>;
+};
+const PROJECT_FILE_TYPES = [{ description: 'HelmetFit project', accept: { 'application/json': ['.json'] } }];
+
+/**
+ * Save project: writes the project file (Chrome/Edge: to the file you pick
+ * once, then updated in place; other browsers: a download) and keeps it in
+ * the history list.
+ */
+async function saveProject() {
+  if (!pieces.length && !currentProjectName) { alert('Add some pieces first.'); return; }
+  const w = window as FilePickerWindow;
+  const suggested = currentProjectName ?? (pieces[0]?.name ?? 'My helmet');
+  let name = suggested;
+  if (w.showSaveFilePicker) {
+    try {
+      // Must open straight from the click, so the file name you choose is the project name.
+      if (!projectFileHandle) {
+        projectFileHandle = await w.showSaveFilePicker({ suggestedName: `${safeFileName(suggested)}.helmetfit.json`, types: PROJECT_FILE_TYPES });
+      }
+      name = projectFileHandle.name.replace(/\.helmetfit\.json$|\.json$/i, '');
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return; // cancelled
+      projectFileHandle = null; // fall back to a download
+    }
+  } else {
+    const typed = prompt('Project name', suggested);
+    if (!typed) return;
+    name = typed;
+  }
+  if (!currentHeadId) status('Tip: save the head too, so the project remembers which head it was fitted to.');
+  await rememberProject(name);
+  const blob = await projectFileBlob(name);
+  if (projectFileHandle) {
+    const out = await (projectFileHandle as unknown as { createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }> }).createWritable();
+    await out.write(blob);
+    await out.close();
+    status(`Saved project "${name}" to ${projectFileHandle.name}`);
+  } else {
+    downloadBlob(blob, `${safeFileName(name)}.helmetfit.json`);
+    status(`Saved project "${name}" (downloaded ${safeFileName(name)}.helmetfit.json)`);
+  }
+}
+
+const safeFileName = (n: string) => n.replace(/[\\/:*?"<>|·]+/g, '_').trim() || 'helmetfit-project';
+
+/** Start over: no pieces, no project (saved projects stay in the history list). */
+function newProject() {
+  if (pieces.length && !confirm('Start a new project? Pieces in the current one are cleared — save first if you want to keep it. (Saved projects stay in the Project list.)')) return;
+  if (snapMode) setSnapMode(false);
+  clearPieces();
+  pieceGroups.length = 0;
+  snapLinks.length = 0;
+  pendingProjectDoc = null;
+  writeTransform(viewer.assembly, identityTransform());
+  undoStack.length = 0; redoStack.length = 0; updateUndoButtons();
+  currentProjectId = null; currentProjectName = null; projectFileHandle = null;
+  ($('project-select') as HTMLSelectElement).value = '';
+  $('fit-msg').textContent = '';
+  for (const im of lastProjectImages.images) URL.revokeObjectURL(im.url);
+  lastProjectImages.images = []; lastProjectImages.file = '';
+  showProjectImages();
+  renderPieceList();
+  afterTransformChange(true);
+  status('New project.');
 }
 
 async function loadProject(id: string) {
@@ -2002,6 +2191,8 @@ async function loadProject(id: string) {
   await beginHudTask('LOADING PROJECT…', `Loading project "${rec.name}"…`);
   try {
     currentProjectId = id;
+    currentProjectName = rec.name;
+    projectFileHandle = null; // a different project: Save asks where to save it
     clearPieces();
     pieceGroups.push(...(rec.groups ?? []).map((g) => ({ ...g })));
     helmetUnit = rec.pieces[0]?.unit ?? 'mm';
@@ -2265,19 +2456,12 @@ function exportProjectData(name = 'helmetfit-project'): ExportedProjectFile {
   };
 }
 
-async function exportProjectFile() {
+/** The project file contents (settings, groups, pieces and where to find their mesh files). */
+async function projectFileBlob(name: string): Promise<Blob> {
   for (const p of pieces) {
-    if (!p.filePath && !filePathCache.has(p.fileName)) {
-      await rememberMeshFile(p.fileName, p.data);
-    }
+    if (!p.filePath && !filePathCache.has(p.fileName)) await rememberMeshFile(p.fileName, p.data);
   }
-  const current = currentProjectId ? await store.projects.get(currentProjectId) : undefined;
-  const defaultName = current?.name ?? (pieces[0]?.name ?? 'helmetfit-project');
-  const data = exportProjectData(defaultName);
-  const safe = defaultName.replace(/[\\/:*?"<>|·]+/g, '_').trim() || 'helmetfit-project';
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  downloadBlob(blob, `${safe}.helmetfit.json`);
-  status(`Exported project "${defaultName}.helmetfit.json"`);
+  return new Blob([JSON.stringify(exportProjectData(name), null, 2)], { type: 'application/json' });
 }
 
 async function importProjectData(raw: string | ExportedProjectFile) {
@@ -2445,6 +2629,7 @@ async function importProjectData(raw: string | ExportedProjectFile) {
       alert(`Loaded project settings for "${doc.name || 'project'}", but could not automatically find these mesh files on your hard drive:\n\n• ${[...new Set(missing)].join('\n• ')}\n\nPlease select those STL/3MF files now and they will automatically orient and size to the project settings.`);
       ($('piece-files') as HTMLInputElement).click();
     } else {
+      await rememberProject(doc.name || 'Project');
       status(`Loaded project "${doc.name || 'project'}"`);
     }
   } finally {
@@ -2644,7 +2829,22 @@ function initUi() {
   $('pics-open').addEventListener('click', () => { picIndex = 0; showProjectImages(); });
   $('snap-mode').addEventListener('click', () => {
     if (!snapMode && pieces.length < 2) { alert('Add at least two pieces first.'); return; }
+    if (!snapMode) snapKind = joinBy; // open in the model's joining method
     setSnapMode(!snapMode);
+  });
+  ($('join-by') as HTMLSelectElement).value = joinBy;
+  $('join-by').addEventListener('change', () => {
+    joinBy = ($('join-by') as HTMLSelectElement).value as typeof joinBy;
+    localStorage.setItem('helmetfit.joinBy', joinBy);
+    if (snapMode && snapKind !== 'points') { snapKind = joinBy; setSnapMode(true); }
+  });
+  ($('magnet-size') as HTMLSelectElement).value = magnetSize ? `${magnetSize.diameter}x${magnetSize.thickness}` : '';
+  $('magnet-size').addEventListener('change', () => {
+    const v = ($('magnet-size') as HTMLSelectElement).value;
+    localStorage.setItem('helmetfit.magnetSize', v);
+    magnetSize = parseMagnetSize(v);
+    pocketCache.clear(); // look again with the new size
+    if (snapMode && snapKind === 'magnets') setSnapMode(true);
   });
   $('snap-done').addEventListener('click', () => setSnapMode(false));
   qsa('[data-snap-kind]').forEach((b) => b.addEventListener('click', () => { snapKind = b.dataset.snapKind as typeof snapKind; setSnapMode(true); }));
@@ -2767,22 +2967,28 @@ function initUi() {
 
   // Projects
   $('project-save').addEventListener('click', saveProject);
-  $('project-select').addEventListener('change', () => { const id = ($('project-select') as HTMLSelectElement).value; if (id) loadProject(id); else currentProjectId = null; });
-  $('project-delete').addEventListener('click', async () => {
-    const id = ($('project-select') as HTMLSelectElement).value;
-    if (!id) return;
-    const rec = await store.projects.get(id);
-    if (!rec || !confirm(`Delete saved project "${rec.name}"? This can't be undone.`)) return;
-    await store.projects.remove(id);
-    currentProjectId = null;
-    await refreshProjectList(null);
+  $('project-select').addEventListener('change', () => {
+    const sel = $('project-select') as HTMLSelectElement;
+    if (sel.value) { loadProject(sel.value); return; }
+    newProject();
+    if (pieces.length) sel.value = currentProjectId ?? ''; // cancelled: keep showing the current project
   });
-  $('project-export').addEventListener('click', exportProjectFile);
-  $('project-import').addEventListener('click', () => ($('project-file') as HTMLInputElement).click());
+  $('project-new').addEventListener('click', newProject);
+  $('project-import').addEventListener('click', async () => {
+    const w = window as FilePickerWindow;
+    if (!w.showOpenFilePicker) { ($('project-file') as HTMLInputElement).click(); return; }
+    try {
+      // Chrome/Edge: keep the file so Save updates it in place.
+      const [h] = await w.showOpenFilePicker({ types: PROJECT_FILE_TYPES });
+      const f = await h.getFile();
+      projectFileHandle = h;
+      await importProjectFile(f);
+    } catch (e) { if ((e as Error).name !== 'AbortError') alert(`Could not open the project: ${(e as Error).message}`); }
+  });
   ($('project-file') as HTMLInputElement).addEventListener('change', async (e) => {
     const f = (e.target as HTMLInputElement).files?.[0];
     (e.target as HTMLInputElement).value = '';
-    if (f) await importProjectFile(f);
+    if (f) { projectFileHandle = null; await importProjectFile(f); }
   });
   $('undo').addEventListener('click', undo);
   $('redo').addEventListener('click', redo);

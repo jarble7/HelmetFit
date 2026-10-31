@@ -32,8 +32,24 @@ function compatibleKinds(a: ConnectorKind = 'pocket', b: ConnectorKind = 'pocket
 /**
  * Find magnet pockets, cylindrical studs, and rectangular pegs/sockets on a piece.
  */
-export function findMagnetHoles(geometry: THREE.BufferGeometry, piece: number, bvh?: MeshBVH): MagnetHole[] {
-  const tree = bvh ?? new MeshBVH(geometry.clone());
+const bvhCache = new WeakMap<THREE.BufferGeometry, MeshBVH>();
+/** Hit-testing structure for pocket checks, built once per geometry. */
+function treeFor(g: THREE.BufferGeometry): MeshBVH {
+  let t = bvhCache.get(g);
+  if (!t) { t = new MeshBVH(g.clone()); bvhCache.set(g, t); }
+  return t;
+}
+/** Forget cached pocket data after a geometry was changed in place. */
+export function forgetPocketData(g: THREE.BufferGeometry) { bvhCache.delete(g); }
+
+/** Magnet size the model was designed for, if the user knows it (mm). */
+export interface MagnetSize { diameter: number; thickness: number }
+
+/** Pocket radius we'd expect for a magnet (pockets are printed a little oversize). */
+const pocketRadiusFits = (r: number, m: MagnetSize) => r >= m.diameter / 2 - 0.6 && r <= m.diameter / 2 + 1.0;
+
+export function findMagnetHoles(geometry: THREE.BufferGeometry, piece: number, bvh?: MeshBVH, size?: MagnetSize): MagnetHole[] {
+  const tree = bvh ?? treeFor(geometry);
   const out: MagnetHole[] = [];
   const faces = findCutFaces(geometry, piece, 3.0, 0.985, 0.25);
   const ray = new THREE.Ray();
@@ -43,27 +59,45 @@ export function findMagnetHoles(geometry: THREE.BufferGeometry, piece: number, b
     if (f.area < Math.PI * 1.4 * 1.4 * 0.6 || f.area > Math.PI * 13.5 * 13.5) continue;
     // Floor/cap must be a filled disc: outline points all at about the same radius, area ≈ πr².
     const radii = f.outline.map(([x, y]) => Math.hypot(x, y));
-    const r = radii.reduce((a, b) => a + b, 0) / radii.length;
+    let r = radii.reduce((a, b) => a + b, 0) / radii.length;
     const spread = Math.sqrt(radii.reduce((a, b) => a + (b - r) ** 2, 0) / radii.length);
-    if (r < 1.4 || r > 13.5 || spread > 0.085 * r) continue;
-    if (Math.abs(f.area - Math.PI * r * r) > 0.25 * Math.PI * r * r) continue;
+    if (r < 1.4 || r > 13.5) continue;
+    // A clean round floor is the usual sign of a pocket. Floors with a chamfer,
+    // ridge or text aren't quite round — still a pocket if the wall is clear.
+    // Known magnet size: only pockets of that size count, and their floors may be rougher.
+    if (size && !pocketRadiusFits(r, size)) continue;
+    const roundFloor = spread <= 0.085 * r && Math.abs(f.area - Math.PI * r * r) <= 0.25 * Math.PI * r * r;
+    const roughFloor = !roundFloor && spread <= (size ? 0.35 : 0.25) * r && f.area >= (size ? 0.5 : 0.6) * Math.PI * r * r && f.area <= (size ? 1.6 : 1.4) * Math.PI * r * r;
+    if (!roundFloor && !roughFloor) continue;
     const axis = f.normal.clone();
     const u = f.u, v = f.v;
     // Walk up +axis: radial rays hitting a wall at ≈ r indicate a recessed pocket.
-    let depth = 0;
+    let depth = 0, steady = 0;
+    const hits: Array<[number, number]> = []; // wall hit points (u, v) for a circle fit
     for (let h = 0.3; h < 15; h += 0.3) {
       const c = f.centre.clone().addScaledVector(axis, h);
       let wall = 0;
-      for (let k = 0; k < 8; k++) {
-        const a = (k / 8) * Math.PI * 2;
+      for (let k = 0; k < 16; k++) {
+        const a = (k / 16) * Math.PI * 2;
         ray.origin.copy(c);
         ray.direction.copy(u).multiplyScalar(Math.cos(a)).addScaledVector(v, Math.sin(a));
         const hit = tree.raycastFirst(ray, THREE.DoubleSide, 0, r * 1.6);
-        if (hit && Math.abs(hit.distance - r) < 0.15 * r + 0.15) wall++;
+        if (hit && Math.abs(hit.distance - r) < 0.2 * r + 0.15) {
+          wall++;
+          hits.push([Math.cos(a) * hit.distance, Math.sin(a) * hit.distance]);
+        }
       }
-      if (wall >= 6) depth = h; else break;
+      // A rough floor needs a near-complete wall all the way up (13 of 16 probes); a clean one 10.
+      if (wall >= (roundFloor || size ? 10 : 13)) { depth = h; steady++; } else break;
     }
-    if (depth >= 0.9) {
+    if (depth >= (size ? Math.max(0.9, 0.6 * size.thickness) : roundFloor ? 0.9 : 1.2)) {
+      // Centre and radius from the wall itself (least-squares circle), not the floor outline.
+      const fit = fitCircle(hits);
+      if (fit && Math.abs(fit.r - r) < 0.3 * r) {
+        f.centre.addScaledVector(u, fit.cx).addScaledVector(v, fit.cy);
+        r = fit.r;
+      }
+      void steady;
       // The opening must be open: looking out along the axis from the floor, nothing in the way close by.
       ray.origin.copy(f.centre).addScaledVector(axis, 0.05);
       ray.direction.copy(axis);
@@ -243,4 +277,68 @@ export function matchMagnets(ha: MagnetHole[], hb: MagnetHole[], max = 6, minPai
     f.bToA = r.matrix; f.rms = r.rms;
   }
   return found.sort((x, y) => y.pairs.length - x.pairs.length || x.rms - y.rms).slice(0, max);
+}
+
+/** Least-squares circle through 2D points (Kåsa fit). */
+function fitCircle(pts: Array<[number, number]>): { cx: number; cy: number; r: number } | null {
+  if (pts.length < 6) return null;
+  let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0, sz = 0;
+  for (const [x, y] of pts) { const z = x * x + y * y; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; sxz += x * z; syz += y * z; sz += z; }
+  const n = pts.length;
+  // Solve [sxx sxy sx; sxy syy sy; sx sy n] [a b c] = [sxz syz sz]; centre (a/2, b/2), r = sqrt(c + cx² + cy²).
+  const M = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, n]], R = [sxz, syz, sz];
+  const det = (m: number[][]) => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  const d = det(M);
+  if (Math.abs(d) < 1e-9) return null;
+  const col = (k: number) => M.map((row, i) => row.map((v, j) => (j === k ? R[i] : v)));
+  const a = det(col(0)) / d, b = det(col(1)) / d, c = det(col(2)) / d;
+  const cx = a / 2, cy = b / 2, rr = c + cx * cx + cy * cy;
+  return rr > 0 ? { cx, cy, r: Math.sqrt(rr) } : null;
+}
+
+/**
+ * Measure a magnet pocket at a clicked spot (piece coordinates) when it wasn't
+ * found automatically: treat the clicked surface as the pocket floor, find the
+ * wall with sideways probes, fit a circle, then walk up to the opening.
+ */
+export function measurePocket(geometry: THREE.BufferGeometry, point: THREE.Vector3, normal: THREE.Vector3, piece: number, size?: MagnetSize): MagnetHole | null {
+  const tree = treeFor(geometry);
+  const axis = normal.clone().normalize();
+  const u = Math.abs(axis.x) < 0.9 ? new THREE.Vector3(1, 0, 0).cross(axis).normalize() : new THREE.Vector3(0, 1, 0).cross(axis).normalize();
+  const v = new THREE.Vector3().crossVectors(axis, u);
+  const ray = new THREE.Ray();
+  const maxR = size ? size.diameter / 2 + 2 : 14;
+  const probe = (centre: THREE.Vector3, h: number) => {
+    const pts: Array<[number, number]> = [];
+    const c = centre.clone().addScaledVector(axis, h);
+    for (let k = 0; k < 24; k++) {
+      const a = (k / 24) * Math.PI * 2;
+      ray.origin.copy(c);
+      ray.direction.copy(u).multiplyScalar(Math.cos(a)).addScaledVector(v, Math.sin(a));
+      const hit = tree.raycastFirst(ray, THREE.DoubleSide, 0, maxR);
+      if (hit) pts.push([Math.cos(a) * hit.distance, Math.sin(a) * hit.distance]);
+    }
+    return pts;
+  };
+  // Twice: the click may be off-centre, so re-centre on the first circle and measure again.
+  let centre = point.clone();
+  let fit: { cx: number; cy: number; r: number } | null = null;
+  for (let pass = 0; pass < 2; pass++) {
+    const pts = probe(centre, 0.4);
+    if (pts.length < 16) return null; // not surrounded by a wall: not inside a pocket
+    fit = fitCircle(pts);
+    if (!fit) return null;
+    centre = centre.clone().addScaledVector(u, fit.cx).addScaledVector(v, fit.cy);
+  }
+  const r = fit!.r;
+  if (r < 1.4 || r > 13.5 || (size && !pocketRadiusFits(r, size))) return null;
+  // Walk up while the wall is still there at about the same radius.
+  let depth = 0.4;
+  for (let h = 0.7; h < 15; h += 0.3) {
+    const pts = probe(centre, h);
+    const ok = pts.filter(([x, y]) => Math.abs(Math.hypot(x, y) - r) < 0.2 * r + 0.15).length;
+    if (ok >= 18) depth = h; else break;
+  }
+  if (depth < 0.9) return null;
+  return { piece, opening: centre.clone().addScaledVector(axis, depth), axis, radius: r, depth, kind: 'pocket' } as MagnetHole;
 }

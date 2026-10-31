@@ -119,7 +119,8 @@ export class Viewer {
         if (hit) this.onHeadPick(hit.point.clone());
         return;
       }
-      const visible = this.assembly.children.filter((c) => c.visible);
+      // Only real, shown pieces (the assembly also holds helpers such as the group pivot).
+      const visible = this.assembly.children.filter((c) => c.visible && (this.isPickable ? this.isPickable(c) : true));
       const hits = rc.intersectObjects(visible, true).filter((h) => this.sectionMode === 'off' || this.section.distanceToPoint(h.point) >= 0);
       if (!hits.length) { this.onPick?.(-1); return; }
       // Skip helper overlays (cut-face highlights) and use the piece they belong to.
@@ -127,7 +128,9 @@ export class Viewer {
       while (o && o.parent !== this.assembly) o = o.parent;
       const h = hits[0];
       const normal = h.face ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : new THREE.Vector3();
-      this.onPick?.(o ? this.assembly.children.indexOf(o) : -1, { point: h.point.clone(), normal });
+      // Ask the app which piece this object is — never rely on its position among the assembly's children.
+      const index = o ? (this.pieceIndexOf ? this.pieceIndexOf(o) : this.assembly.children.indexOf(o)) : -1;
+      this.onPick?.(index, { point: h.point.clone(), normal });
     });
   }
 
@@ -196,6 +199,18 @@ export class Viewer {
     }
     this.headMaterial.needsUpdate = true;
     this.requestRender();
+  }
+
+  /** Which piece an assembly child is (index in the app's piece list), or -1. */
+  pieceIndexOf: ((o: THREE.Object3D) => number) | null = null;
+  /** Whether an assembly child can be clicked (e.g. not in a hidden group). */
+  isPickable: ((o: THREE.Object3D) => boolean) | null = null;
+
+  /** Rebuild a piece's fast hit-testing data after its geometry was changed in place (e.g. rescaled). */
+  refreshPickData(geometry: THREE.BufferGeometry) {
+    const bvh = new MeshBVH(geometry);
+    geometry.userData.bvh = bvh;
+    (geometry as THREE.BufferGeometry & { boundsTree?: MeshBVH }).boundsTree = bvh;
   }
 
   /** Create the display object for a piece; caller positions it. */
